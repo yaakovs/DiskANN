@@ -18,7 +18,7 @@ typedef io_context_t IOContext;
 #include <minwinbase.h>
 
 #ifndef USE_BING_INFRA
-struct IOContext{
+struct IOContext {
   HANDLE                  fhandle = NULL;
   HANDLE                  iocp = NULL;
   std::vector<OVERLAPPED> reqs;
@@ -77,7 +77,7 @@ struct AlignedRead {
 class AlignedFileReader {
  protected:
   tsl::robin_map<std::thread::id, IOContext> ctx_map;
-  std::mutex ctx_mut;
+  std::mutex                                 ctx_mut;
 
  public:
   // returns the thread-specific context
@@ -90,6 +90,7 @@ class AlignedFileReader {
   virtual void register_thread() = 0;
   // de-register thread-id for a context
   virtual void deregister_thread() = 0;
+  virtual void deregister_all_threads() = 0;
 
   // Open & close ops
   // Blocking calls

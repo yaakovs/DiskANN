@@ -82,14 +82,8 @@ namespace {
       }
       */
     }
-
-    /*
-    for(unsigned i=0;i<64;i++){
-      std::cout << *((unsigned*)read_reqs[0].buf + i) << " ";
-    }
-    std::cout << std::endl;*/
   }
-}
+}  // namespace
 
 LinuxAlignedFileReader::LinuxAlignedFileReader() {
   this->file_desc = -1;
@@ -141,8 +135,8 @@ void LinuxAlignedFileReader::register_thread() {
     std::cerr << "io_setup() failed; returned " << ret << ", errno=" << errno
               << ":" << ::strerror(errno) << std::endl;
   } else {
-    std::cerr << "allocating ctx: " << ctx << " to thread-id:" << my_id
-              << std::endl;
+    diskann::cout << "allocating ctx: " << ctx << " to thread-id:" << my_id
+                  << std::endl;
     ctx_map[my_id] = ctx;
   }
   lk.unlock();
@@ -162,6 +156,21 @@ void LinuxAlignedFileReader::deregister_thread() {
   std::cerr << "returned ctx from thread-id:" << my_id << std::endl;
   lk.unlock();
 }
+
+void LinuxAlignedFileReader::deregister_all_threads() {
+  std::unique_lock<std::mutex> lk(ctx_mut);
+  for (auto x = ctx_map.begin(); x != ctx_map.end(); x++) {
+    io_context_t ctx = x.value();
+    io_destroy(ctx);
+    //  assert(ret == 0);
+    //  lk.lock();
+    //  ctx_map.erase(my_id);
+    //  std::cerr << "returned ctx from thread-id:" << my_id << std::endl;
+  }
+  ctx_map.clear();
+  //  lk.unlock();
+}
+
 
 void LinuxAlignedFileReader::open(const std::string &fname) {
   int flags = O_DIRECT | O_RDONLY | O_LARGEFILE;
@@ -184,6 +193,9 @@ void LinuxAlignedFileReader::close() {
 
 void LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs,
                                   io_context_t &ctx, bool async) {
+                                    if (async == true) {
+                                      diskann::cout<<"Async currently not supported in linux." << std::endl;
+                                    }
   assert(this->file_desc != -1);
   //#pragma omp critical
   //	std::cout << "thread: " << std::this_thread::get_id() << ", crtx: " <<

@@ -27,22 +27,45 @@ typedef int FileHandle;
 
 #include "cached_io.h"
 #include "common_includes.h"
+#include "tsl/robin_set.h"
+
 #include "utils.h"
 #include "windows_customizations.h"
 
 namespace diskann {
-  const size_t   TRAINING_SET_SIZE = 1500000;
+  const size_t   MAX_PQ_TRAINING_SET_SIZE = 256000;
+  const size_t   MAX_SAMPLE_POINTS_FOR_WARMUP = 100000;
+  const double   PQ_TRAINING_SET_FRACTION = 0.1;
   const double   SPACE_FOR_CACHED_NODES_IN_GB = 0.25;
   const double   THRESHOLD_FOR_CACHING_IN_GB = 1.0;
   const uint32_t NUM_NODES_TO_CACHE = 250000;
   const uint32_t WARMUP_L = 20;
+  const uint32_t NUM_KMEANS_REPS = 12;
 
   template<typename T>
   class PQFlashIndex;
 
+  DISKANN_DLLEXPORT double get_memory_budget(const std::string &mem_budget_str);
+  DISKANN_DLLEXPORT double get_memory_budget(double search_ram_budget_in_gb);
+  DISKANN_DLLEXPORT void   add_new_file_to_single_index(std::string index_file,
+                                                        std::string new_file);
+
+  DISKANN_DLLEXPORT size_t calculate_num_pq_chunks(double final_index_ram_limit,
+                                                   size_t points_num,
+                                                   uint32_t dim);
+
   DISKANN_DLLEXPORT double calculate_recall(
       unsigned num_queries, unsigned *gold_std, float *gs_dist, unsigned dim_gs,
       unsigned *our_results, unsigned dim_or, unsigned recall_at);
+
+  DISKANN_DLLEXPORT double calculate_recall(
+      unsigned num_queries, unsigned *gold_std, float *gs_dist, unsigned dim_gs,
+      unsigned *our_results, unsigned dim_or, unsigned recall_at,
+      const tsl::robin_set<unsigned> &active_tags);
+
+  DISKANN_DLLEXPORT double calculate_range_search_recall(
+      unsigned num_queries, std::vector<std::vector<_u32>> &groundtruth,
+      std::vector<std::vector<_u32>> &our_results);
 
   DISKANN_DLLEXPORT void read_idmap(const std::string &    fname,
                                     std::vector<unsigned> &ivecs);
@@ -69,6 +92,11 @@ namespace diskann {
                                      const std::string &medoids_file);
 
   template<typename T>
+  DISKANN_DLLEXPORT std::string preprocess_base_file(
+      const std::string &infile, const std::string &indexPrefix,
+      diskann::Metric &distMetric);
+
+  template<typename T>
   DISKANN_DLLEXPORT int build_merged_vamana_index(
       std::string base_file, diskann::Metric _compareMetric, unsigned L,
       unsigned R, double sampling_rate, double ram_budget,
@@ -82,7 +110,7 @@ namespace diskann {
       uint32_t nthreads, uint32_t start_bw = 2);
 
   template<typename T>
-  DISKANN_DLLEXPORT bool build_disk_index(const char *    dataFilePath,
+  DISKANN_DLLEXPORT int build_disk_index(const char *    dataFilePath,
                                           const char *    indexFilePath,
                                           const char *    indexBuildParameters,
                                           diskann::Metric _compareMetric);
@@ -90,6 +118,7 @@ namespace diskann {
   template<typename T>
   DISKANN_DLLEXPORT void create_disk_layout(const std::string base_file,
                                             const std::string mem_index_file,
-                                            const std::string output_file);
+                                            const std::string output_file,
+                                            const std::string reorder_data_file = std::string(""));
 
 }  // namespace diskann

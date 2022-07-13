@@ -14,6 +14,9 @@
 #include <limits>
 #include <cstring>
 #include <queue>
+#include <omp.h>
+#include <mkl.h>
+#include <boost/program_options.hpp>
 
 #ifdef _WINDOWS
 #include <malloc.h>
@@ -21,8 +24,6 @@
 #include <stdlib.h>
 #endif
 
-#include "mkl.h"
-#include "omp.h"
 #include "utils.h"
 
 // WORKS FOR UPTO 2 BILLION POINTS (as we use INT INSTEAD OF UNSIGNED)
@@ -30,12 +31,7 @@
 #define PARTSIZE 10000000
 #define ALIGNMENT 512
 
-void command_line_help() {
-  std::cerr
-      << "<exact-kann> <int8/uint8/float>   <base bin file> <query bin "
-         "file>  <K: # nearest neighbors to compute> <output-truthset-file>"
-      << std::endl;
-}
+namespace po = boost::program_options;
 
 template<class T>
 T div_round_up(const T numerator, const T denominator) {
@@ -104,6 +100,27 @@ void distsq_to_points(
     delete[] ones_vec;
 }
 
+void inner_prod_to_points(
+    const size_t dim,
+    float *      dist_matrix,  // Col Major, cols are queries, rows are points
+    size_t npoints, const float *const points, size_t nqueries,
+    const float *const queries,
+    float *ones_vec = NULL)  // Scratchspace of num_data size and init to 1.0
+{
+  bool ones_vec_alloc = false;
+  if (ones_vec == NULL) {
+    ones_vec = new float[nqueries > npoints ? nqueries : npoints];
+    std::fill_n(ones_vec, nqueries > npoints ? nqueries : npoints, (float) 1.0);
+    ones_vec_alloc = true;
+  }
+  cblas_sgemm(CblasColMajor, CblasTrans, CblasNoTrans, npoints, nqueries, dim,
+              (float) -1.0, points, dim, queries, dim, (float) 0.0, dist_matrix,
+              npoints);
+
+  if (ones_vec_alloc)
+    delete[] ones_vec;
+}
+
 void exact_knn(const size_t dim, const size_t k,
                int *const closest_points,  // k * num_queries preallocated, col
                                            // major, queries columns
@@ -111,14 +128,58 @@ void exact_knn(const size_t dim, const size_t k,
                                                   // preallocated, Dist to
                                                   // corresponding closes_points
                size_t             npoints,
-               const float *const points,  // points in Col major
-               size_t             nqueries,
-               const float *const queries)  // queries in Col major
+               float * points_in,  // points in Col major
+               size_t nqueries,  float * queries_in,
+               diskann::Metric metric = diskann::Metric::L2)  // queries in Col major
 {
   float *points_l2sq = new float[npoints];
   float *queries_l2sq = new float[nqueries];
+  compute_l2sq(points_l2sq, points_in, npoints, dim);
+  compute_l2sq(queries_l2sq, queries_in, nqueries, dim);
+
+  float* points = points_in;
+  float* queries = queries_in;
+
+  if (metric == diskann::Metric::COSINE) { // we convert cosine distance as normalized L2 distnace
+    points = new float[npoints*dim];
+    queries = new float[nqueries*dim];
+#pragma omp parallel for schedule(static, 4096)
+    for (_s64 i =0; i < npoints; i++) {
+      float norm = std::sqrt(points_l2sq[i]);
+      if (norm==0) {
+        norm = std::numeric_limits<float>::epsilon();
+      }
+      for (_u32 j=0; j < dim; j++) {
+        points[i*dim + j] = points_in[i*dim+j]/ norm;
+      }
+    }
+
+#pragma omp parallel for schedule(static, 4096)
+    for (_s64 i =0; i < nqueries; i++) {
+      float norm = std::sqrt(queries_l2sq[i]);
+      if (norm==0) {
+        norm = std::numeric_limits<float>::epsilon();
+      }
+      for (_u32 j=0; j < dim; j++) {
+        queries[i*dim + j] = queries_in[i*dim +j]/ norm;
+      }
+    }
+    //recalculate norms after normalizing, they should all be one. 
   compute_l2sq(points_l2sq, points, npoints, dim);
   compute_l2sq(queries_l2sq, queries, nqueries, dim);
+  }
+
+
+  std::cout << "Going to compute " << k << " NNs for " << nqueries
+            << " queries over " << npoints << " points in " << dim
+            << " dimensions using";
+  if (metric==diskann::Metric::INNER_PRODUCT)
+    std::cout << " MIPS ";
+  else if(metric==diskann::Metric::COSINE)
+    std::cout << " Cosine ";
+  else
+    std::cout << " L2 ";  
+  std::cout << "distance fn. " << std::endl;
 
   size_t q_batch_size = (1 << 9);
   float *dist_matrix = new float[(size_t) q_batch_size * (size_t) npoints];
@@ -128,9 +189,14 @@ void exact_knn(const size_t dim, const size_t k,
     int64_t q_e =
         ((b + 1) * q_batch_size > nqueries) ? nqueries : (b + 1) * q_batch_size;
 
-    distsq_to_points(dim, dist_matrix, npoints, points, points_l2sq, q_e - q_b,
-                     queries + (ptrdiff_t) q_b * (ptrdiff_t) dim,
-                     queries_l2sq + q_b);
+    if (metric == diskann::Metric::L2 || metric == diskann::Metric::COSINE) {
+      distsq_to_points(dim, dist_matrix, npoints, points, points_l2sq,
+                       q_e - q_b, queries + (ptrdiff_t) q_b * (ptrdiff_t) dim,
+                       queries_l2sq + q_b);
+    } else {
+      inner_prod_to_points(dim, dist_matrix, npoints, points, q_e - q_b,
+                           queries + (ptrdiff_t) q_b * (ptrdiff_t) dim);
+    }
     std::cout << "Computed distances for queries: [" << q_b << "," << q_e << ")"
               << std::endl;
 
@@ -171,6 +237,11 @@ void exact_knn(const size_t dim, const size_t k,
 
   delete[] points_l2sq;
   delete[] queries_l2sq;
+
+  if (metric == diskann::Metric::COSINE) {
+    delete[] points;
+    delete[] queries;
+  }
 }
 
 template<typename T>
@@ -238,7 +309,6 @@ inline void save_bin(const std::string filename, T *data, size_t npts,
             << ", size = " << npts * ndims * sizeof(T) + 2 * sizeof(int) << "B"
             << std::endl;
 
-  //    data = new T[npts_u64 * ndims_u64];
   writer.write((char *) data, npts * ndims * sizeof(T));
   writer.close();
   std::cout << "Finished writing bin" << std::endl;
@@ -265,13 +335,9 @@ inline void save_groundtruth_as_one_file(const std::string filename,
 }
 
 template<typename T>
-int aux_main(int argv, char **argc) {
- 
-  size_t      npoints, nqueries, dim;
-  std::string base_file(argc[2]);
-  std::string query_file(argc[3]);
-  size_t      k = atoi(argc[4]);
-  std::string gt_file(argc[5]);
+int aux_main(const std::string &base_file, const std::string &query_file,
+             const std::string &gt_file, size_t k, const diskann::Metric &metric) {
+  size_t npoints, nqueries, dim;
 
   float *base_data;
   float *query_data;
@@ -291,7 +357,7 @@ int aux_main(int argv, char **argc) {
     float *dist_closest_points_part = new float[nqueries * k];
 
     exact_knn(dim, k, closest_points_part, dist_closest_points_part, npoints,
-              base_data, nqueries, query_data);
+              base_data, nqueries, query_data, metric);
 
     for (_u64 i = 0; i < nqueries; i++) {
       for (_u64 j = 0; j < k; j++) {
@@ -303,6 +369,7 @@ int aux_main(int argv, char **argc) {
 
     delete[] closest_points_part;
     delete[] dist_closest_points_part;
+
     diskann::aligned_free(base_data);
   }
 
@@ -311,7 +378,10 @@ int aux_main(int argv, char **argc) {
     std::sort(cur_res.begin(), cur_res.end(), custom_dist);
     for (_u64 j = 0; j < k; j++) {
       closest_points[i * k + j] = (int32_t) cur_res[j].first;
-      dist_closest_points[i * k + j] = cur_res[j].second;
+      if (metric == diskann::Metric::INNER_PRODUCT)
+        dist_closest_points[i * k + j] = -cur_res[j].second;
+      else
+        dist_closest_points[i * k + j] = cur_res[j].second;
     }
   }
 
@@ -324,15 +394,74 @@ int aux_main(int argv, char **argc) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 6) {
-    command_line_help();
+  std::string data_type, dist_fn, base_file, query_file, gt_file;
+  uint64_t    K;
+
+  try {
+    po::options_description desc{"Arguments"};
+
+    desc.add_options()("help,h", "Print information on arguments");
+
+    desc.add_options()("data_type",
+                       po::value<std::string>(&data_type)->required(),
+                       "data type <int8/uint8/float>");
+    desc.add_options()("dist_fn", po::value<std::string>(&dist_fn)->required(),
+                       "distance function <l2/mips>");
+    desc.add_options()("base_file",
+                       po::value<std::string>(&base_file)->required(),
+                       "File containing the base vectors in binary format");
+    desc.add_options()("query_file",
+                       po::value<std::string>(&query_file)->required(),
+                       "File containing the query vectors in binary format");
+    desc.add_options()(
+        "gt_file", po::value<std::string>(&gt_file)->required(),
+        "File name for the writing ground truth in binary format");
+    desc.add_options()("K", po::value<uint64_t>(&K)->required(),
+                       "Number of ground truth nearest neighbors to compute");
+
+    po::variables_map vm;
+    po::store(po::parse_command_line(argc, argv, desc), vm);
+    if (vm.count("help")) {
+      std::cout << desc;
+      return 0;
+    }
+    po::notify(vm);
+  } catch (const std::exception &ex) {
+    std::cerr << ex.what() << '\n';
     return -1;
   }
 
-  if (std::string(argv[1]) == std::string("float"))
-    aux_main<float>(argc, argv);
-  if (std::string(argv[1]) == std::string("int8"))
-    aux_main<int8_t>(argc, argv);
-  if (std::string(argv[1]) == std::string("uint8"))
-    aux_main<uint8_t>(argc, argv);
+  if (data_type != std::string("float") && data_type != std::string("int8") &&
+      data_type != std::string("uint8")) {
+    std::cout << "Unsupported type. float, int8 and uint8 types are supported."
+              << std::endl;
+    return -1;
+  }
+
+  diskann::Metric metric;
+  if (dist_fn == std::string("l2")) {
+    metric = diskann::Metric::L2;
+  } else if (dist_fn == std::string("mips")) {
+    metric = diskann::Metric::INNER_PRODUCT;
+  } else if (dist_fn == std::string("cosine")) {
+    metric = diskann::Metric::COSINE;
+  } else {
+    std::cerr << "Unsupported distance function. Use l2/mips/cosine." << std::endl;
+    return -1;
+  }
+
+try {
+  if (data_type == std::string("float"))
+    aux_main<float>(base_file, query_file, gt_file, K, metric);
+  if (data_type == std::string("int8"))
+    aux_main<int8_t>(base_file, query_file, gt_file, K, metric);
+  if (data_type == std::string("uint8"))
+    aux_main<uint8_t>(base_file, query_file, gt_file, K, metric);
 }
+catch (const std::exception& e) {
+    std::cout << std::string(e.what()) << std::endl;
+    diskann::cerr << "Compute GT failed." << std::endl;
+    return -1;
+  }
+}
+
