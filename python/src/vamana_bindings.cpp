@@ -31,6 +31,7 @@ PYBIND11_MODULE(vamanapy, m) {
     .value("INNER_PRODUCT", Metric::INNER_PRODUCT)
     .value("FAST_L2", Metric::FAST_L2)
     .value("PQ", Metric::PQ)
+    .value("COSINE", Metric::COSINE)
     .export_values();
 
   py::class_<Parameters>(m, "Parameters")
